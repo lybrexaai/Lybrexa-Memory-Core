@@ -1,31 +1,165 @@
-import { useState, useRef, useEffect } from "react";
-import { 
+import { useState, useRef, useEffect, useCallback } from "react";
+import {
   useListConversations, getListConversationsQueryKey,
   useGetConversation, getGetConversationQueryKey,
-  useCreateConversation, useSendMessage, useDeleteConversation 
+  useCreateConversation, useDeleteConversation,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, Send, Bot, User, Loader2 } from "lucide-react";
+import { Plus, Trash2, Send, Bot, User, Loader2, Zap } from "lucide-react";
 import { format } from "date-fns";
+
+type LocalMessage = {
+  id?: number;
+  role: "user" | "assistant";
+  content: string;
+  agentUsed?: string | null;
+  streaming?: boolean;
+};
+
+function useStreamingChat(activeId: number | null) {
+  const queryClient = useQueryClient();
+  const [localMessages, setLocalMessages] = useState<LocalMessage[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Sync localMessages with server messages when conversation changes
+  const syncFromServer = useCallback((msgs: LocalMessage[]) => {
+    setLocalMessages(msgs);
+  }, []);
+
+  const send = useCallback(async (content: string) => {
+    if (!activeId || !content.trim() || isStreaming) return;
+
+    setStreamError(null);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    // Optimistically add user message and an empty assistant placeholder
+    const userMsg: LocalMessage = { role: "user", content };
+    const assistantPlaceholder: LocalMessage = { role: "assistant", content: "", streaming: true };
+    setLocalMessages(prev => [...prev, userMsg, assistantPlaceholder]);
+    setIsStreaming(true);
+
+    const token = localStorage.getItem("lybrexa_token");
+    let detectedAgent: string | null = null;
+
+    try {
+      const resp = await fetch(`/api/chat/conversations/${activeId}/messages/stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ content }),
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: "Unknown error" }));
+        throw new Error(err.error ?? `HTTP ${resp.status}`);
+      }
+
+      if (!resp.body) throw new Error("No response body");
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6).trim();
+          if (!raw) continue;
+
+          let event: Record<string, unknown>;
+          try { event = JSON.parse(raw); } catch { continue; }
+
+          if (event.type === "init") {
+            detectedAgent = event.agentUsed as string;
+          } else if (event.type === "token") {
+            const tok = event.token as string;
+            setLocalMessages(prev => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last?.streaming) {
+                next[next.length - 1] = { ...last, content: last.content + tok };
+              }
+              return next;
+            });
+          } else if (event.type === "done") {
+            const finalAgent = (event.agentUsed as string) ?? detectedAgent;
+            setLocalMessages(prev => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last?.streaming) {
+                next[next.length - 1] = { ...last, streaming: false, agentUsed: finalAgent, id: event.assistantMessageId as number };
+              }
+              return next;
+            });
+            // Refresh server data
+            queryClient.invalidateQueries({ queryKey: getGetConversationQueryKey(activeId) });
+            queryClient.invalidateQueries({ queryKey: getListConversationsQueryKey() });
+          } else if (event.type === "error") {
+            throw new Error(event.error as string);
+          }
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") return;
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      setStreamError(msg);
+      // Remove streaming placeholder on error
+      setLocalMessages(prev => prev.filter(m => !m.streaming));
+    } finally {
+      setIsStreaming(false);
+      abortRef.current = null;
+    }
+  }, [activeId, isStreaming, queryClient]);
+
+  return { localMessages, syncFromServer, send, isStreaming, streamError };
+}
 
 export default function Chat() {
   const [activeId, setActiveId] = useState<number | null>(null);
   const [input, setInput] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const queryClient = useQueryClient();
+
   const { data: conversations, isLoading: isLoadingConvs } = useListConversations();
   const { data: activeConv, isLoading: isLoadingMessages } = useGetConversation(activeId!, {
-    query: { enabled: !!activeId, queryKey: getGetConversationQueryKey(activeId!) }
+    query: { enabled: !!activeId, queryKey: getGetConversationQueryKey(activeId!) },
   });
 
   const createMutation = useCreateConversation();
-  const sendMutation = useSendMessage();
   const deleteMutation = useDeleteConversation();
+
+  const { localMessages, syncFromServer, send, isStreaming, streamError } = useStreamingChat(activeId);
+
+  // Sync server messages into local state when conversation loads / changes
+  useEffect(() => {
+    if (activeConv?.messages && !isStreaming) {
+      syncFromServer(activeConv.messages.map(m => ({
+        id: m.id,
+        role: m.role as "user" | "assistant",
+        content: m.content,
+        agentUsed: m.agentUsed ?? null,
+      })));
+    }
+  }, [activeConv?.messages, isStreaming, syncFromServer]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeConv?.messages]);
+  }, [localMessages]);
 
   useEffect(() => {
     if (conversations?.length && !activeId) {
@@ -34,28 +168,23 @@ export default function Chat() {
   }, [conversations, activeId]);
 
   const handleCreate = () => {
-    createMutation.mutate({ data: { title: "New Comms Link" } }, {
+    createMutation.mutate({ data: { title: undefined } }, {
       onSuccess: (newConv) => {
         queryClient.invalidateQueries({ queryKey: getListConversationsQueryKey() });
+        syncFromServer([]);
         setActiveId(newConv.id);
-      }
+      },
     });
   };
 
-  const handleSend = (e: React.FormEvent) => {
+  const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || !activeId) return;
-
-    const content = input;
+    const content = input.trim();
+    if (!content || !activeId || isStreaming) return;
     setInput("");
-
-    // Optimistic update could go here
-    sendMutation.mutate({ id: activeId, data: { content } }, {
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: getGetConversationQueryKey(activeId) });
-        queryClient.invalidateQueries({ queryKey: getListConversationsQueryKey() });
-      }
-    });
+    // Reset textarea height
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+    await send(content);
   };
 
   const handleDelete = (id: number, e: React.MouseEvent) => {
@@ -63,146 +192,221 @@ export default function Chat() {
     deleteMutation.mutate({ id }, {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: getListConversationsQueryKey() });
-        if (activeId === id) setActiveId(null);
-      }
+        if (activeId === id) {
+          setActiveId(null);
+          syncFromServer([]);
+        }
+      },
     });
   };
 
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend(e as unknown as React.FormEvent);
+    }
+  };
+
+  const handleTextareaInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value);
+    // Auto-resize
+    const el = e.target;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 200) + "px";
+  };
+
   return (
-    <div className="flex h-full w-full">
-      {/* Sidebar */}
-      <div className="w-80 border-r border-border bg-sidebar/50 backdrop-blur flex flex-col">
+    <div className="flex h-full w-full" data-testid="chat-page">
+      {/* Conversation sidebar */}
+      <div className="w-72 border-r border-border bg-sidebar/50 backdrop-blur flex flex-col shrink-0">
         <div className="p-4 border-b border-border flex justify-between items-center">
-          <h2 className="font-mono text-sm uppercase tracking-wider text-muted-foreground">Comms Links</h2>
-          <button 
+          <h2 className="font-mono text-xs uppercase tracking-widest text-muted-foreground">Comm Links</h2>
+          <button
+            data-testid="button-new-conversation"
             onClick={handleCreate}
             disabled={createMutation.isPending}
-            className="p-2 hover:bg-primary/20 hover:text-primary rounded text-muted-foreground transition-colors"
+            className="p-1.5 hover:bg-primary/20 hover:text-primary rounded text-muted-foreground transition-colors"
           >
             {createMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
           </button>
         </div>
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+
+        <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
           {isLoadingConvs ? (
-            <div className="p-4 text-center text-muted-foreground text-sm font-mono animate-pulse">Scanning frequencies...</div>
+            <div className="p-4 text-center text-muted-foreground text-xs font-mono animate-pulse">Scanning frequencies...</div>
+          ) : conversations?.length === 0 ? (
+            <div className="p-4 text-center text-muted-foreground text-xs font-mono opacity-50">No comm links</div>
           ) : conversations?.map(c => (
-            <div 
+            <div
               key={c.id}
-              onClick={() => setActiveId(c.id)}
-              className={`p-3 rounded cursor-pointer group flex items-center justify-between border ${
-                activeId === c.id 
-                  ? "bg-card border-primary shadow-[0_0_15px_rgba(157,75,255,0.1)]" 
+              data-testid={`conversation-item-${c.id}`}
+              onClick={() => { setActiveId(c.id); syncFromServer([]); }}
+              className={`p-3 rounded cursor-pointer group flex items-start justify-between border transition-all ${
+                activeId === c.id
+                  ? "bg-card border-primary/40 shadow-[0_0_12px_rgba(157,75,255,0.08)]"
                   : "bg-transparent border-transparent hover:bg-sidebar-accent"
               }`}
             >
-              <div className="truncate pr-4 flex-1">
-                <div className={`text-sm truncate ${activeId === c.id ? "text-primary-foreground font-medium" : "text-muted-foreground"}`}>
-                  {c.title || "Untitled Link"}
+              <div className="truncate pr-2 flex-1 min-w-0">
+                <div className={`text-xs truncate font-medium ${activeId === c.id ? "text-foreground" : "text-muted-foreground"}`}>
+                  {c.title ?? "Untitled Link"}
                 </div>
-                <div className="text-[10px] text-muted-foreground font-mono mt-1">
-                  {format(new Date(c.updatedAt), "HH:mm:ss")}
+                <div className="flex items-center gap-1.5 mt-1">
+                  {c.agentUsed && (
+                    <span className="text-[9px] uppercase tracking-wider font-mono text-accent/70 bg-accent/10 px-1 py-0.5 rounded border border-accent/15">
+                      {c.agentUsed}
+                    </span>
+                  )}
+                  <span className="text-[9px] text-muted-foreground font-mono">
+                    {format(new Date(c.updatedAt), "HH:mm")}
+                  </span>
                 </div>
               </div>
-              <button 
+              <button
+                data-testid={`button-delete-conversation-${c.id}`}
                 onClick={(e) => handleDelete(c.id, e)}
-                className="opacity-0 group-hover:opacity-100 p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded transition-all"
+                className="opacity-0 group-hover:opacity-100 p-1 mt-0.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded transition-all shrink-0"
               >
-                <Trash2 className="w-3.5 h-3.5" />
+                <Trash2 className="w-3 h-3" />
               </button>
             </div>
           ))}
         </div>
       </div>
 
-      {/* Main Chat Area */}
-      <div className="flex-1 flex flex-col bg-background/50 relative">
+      {/* Main chat area */}
+      <div className="flex-1 flex flex-col min-w-0">
         {activeId ? (
           <>
-            <div className="p-4 border-b border-border bg-card/50 backdrop-blur z-10 flex items-center justify-between">
-              <div>
-                <h3 className="font-medium text-foreground">{activeConv?.title || "Connecting..."}</h3>
-                <p className="text-xs text-muted-foreground font-mono mt-1">SECURE CHANNEL ESTABLISHED</p>
+            {/* Header */}
+            <div className="px-6 py-3 border-b border-border bg-card/30 backdrop-blur flex items-center gap-3 shrink-0">
+              <div className="flex-1 min-w-0">
+                <h3 className="font-medium text-sm text-foreground truncate">
+                  {activeConv?.title ?? "Connecting..."}
+                </h3>
+                <p className="text-[10px] text-muted-foreground font-mono tracking-widest mt-0.5">SECURE CHANNEL ESTABLISHED</p>
               </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto p-6 space-y-6">
-              {isLoadingMessages ? (
-                <div className="flex justify-center py-10"><Loader2 className="w-6 h-6 text-primary animate-spin" /></div>
-              ) : activeConv?.messages.map((m, i) => (
-                <div key={m.id || i} className={`flex gap-4 max-w-4xl mx-auto ${m.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                  <div className={`w-8 h-8 rounded shrink-0 flex items-center justify-center border ${
-                    m.role === 'user' 
-                      ? 'bg-primary/20 border-primary text-primary shadow-[0_0_10px_rgba(157,75,255,0.2)]' 
-                      : 'bg-card border-border text-accent shadow-[0_0_10px_rgba(0,229,255,0.1)]'
-                  }`}>
-                    {m.role === 'user' ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
-                  </div>
-                  <div className={`flex flex-col gap-1 ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
-                    <div className="flex items-center gap-2 px-1">
-                      <span className="text-[10px] uppercase tracking-wider font-mono text-muted-foreground">
-                        {m.role === 'user' ? 'Operator' : 'Lybrexa AI'}
-                      </span>
-                      {m.agentUsed && (
-                        <span className="text-[9px] uppercase tracking-wider font-mono bg-accent/10 text-accent px-1.5 py-0.5 rounded border border-accent/20">
-                          via {m.agentUsed}
-                        </span>
-                      )}
-                    </div>
-                    <div className={`p-4 rounded-lg text-sm leading-relaxed whitespace-pre-wrap ${
-                      m.role === 'user' 
-                        ? 'bg-primary/10 border border-primary/30 text-primary-foreground' 
-                        : 'bg-card border border-border text-foreground'
-                    }`}>
-                      {m.content}
-                    </div>
-                  </div>
-                </div>
-              ))}
-              {sendMutation.isPending && (
-                <div className="flex gap-4 max-w-4xl mx-auto">
-                  <div className="w-8 h-8 rounded shrink-0 flex items-center justify-center border bg-card border-border text-accent shadow-[0_0_10px_rgba(0,229,255,0.1)]">
-                    <Bot className="w-4 h-4" />
-                  </div>
-                  <div className="p-4 rounded-lg bg-card border border-border flex items-center gap-2">
-                    <span className="w-2 h-2 bg-accent rounded-full animate-bounce"></span>
-                    <span className="w-2 h-2 bg-accent rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></span>
-                    <span className="w-2 h-2 bg-accent rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></span>
-                  </div>
+              {isStreaming && (
+                <div className="flex items-center gap-1.5 text-accent text-[10px] font-mono tracking-widest shrink-0">
+                  <Zap className="w-3 h-3 animate-pulse" />
+                  STREAMING
                 </div>
               )}
+            </div>
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
+              {isLoadingMessages && localMessages.length === 0 ? (
+                <div className="flex justify-center py-16">
+                  <Loader2 className="w-5 h-5 text-primary animate-spin" />
+                </div>
+              ) : localMessages.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full text-muted-foreground font-mono py-16">
+                  <Bot className="w-12 h-12 mb-4 opacity-15" />
+                  <p className="text-xs uppercase tracking-widest opacity-50">Awaiting transmission</p>
+                </div>
+              ) : (
+                localMessages.map((m, i) => (
+                  <div
+                    key={m.id ?? `local-${i}`}
+                    data-testid={`message-${m.role}-${i}`}
+                    className={`flex gap-3 ${m.role === "user" ? "flex-row-reverse" : ""}`}
+                  >
+                    {/* Avatar */}
+                    <div className={`w-7 h-7 rounded shrink-0 flex items-center justify-center border ${
+                      m.role === "user"
+                        ? "bg-primary/15 border-primary/40 text-primary"
+                        : "bg-card border-border text-accent"
+                    }`}>
+                      {m.role === "user" ? <User className="w-3.5 h-3.5" /> : <Bot className="w-3.5 h-3.5" />}
+                    </div>
+
+                    {/* Bubble */}
+                    <div className={`flex flex-col gap-1 max-w-[75%] ${m.role === "user" ? "items-end" : "items-start"}`}>
+                      <div className="flex items-center gap-2 px-0.5">
+                        <span className="text-[9px] uppercase tracking-widest font-mono text-muted-foreground">
+                          {m.role === "user" ? "Operator" : "Lybrexa"}
+                        </span>
+                        {m.agentUsed && (
+                          <span className="text-[8px] uppercase tracking-wider font-mono bg-accent/10 text-accent px-1.5 py-0.5 rounded border border-accent/20">
+                            via {m.agentUsed}
+                          </span>
+                        )}
+                        {m.streaming && (
+                          <span className="text-[8px] uppercase tracking-wider font-mono bg-primary/10 text-primary px-1.5 py-0.5 rounded border border-primary/20 animate-pulse">
+                            live
+                          </span>
+                        )}
+                      </div>
+
+                      <div className={`px-4 py-3 rounded-lg text-sm leading-relaxed whitespace-pre-wrap ${
+                        m.role === "user"
+                          ? "bg-primary/10 border border-primary/25 text-foreground"
+                          : "bg-card border border-border text-foreground"
+                      }`}>
+                        {m.content}
+                        {m.streaming && (
+                          <span className="inline-block w-0.5 h-4 bg-primary ml-0.5 align-middle animate-pulse" />
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))
+              )}
+
+              {/* Error banner */}
+              {streamError && (
+                <div className="max-w-2xl mx-auto p-3 bg-destructive/10 border border-destructive/30 rounded text-xs text-destructive font-mono">
+                  TRANSMISSION ERROR: {streamError}
+                </div>
+              )}
+
               <div ref={messagesEndRef} />
             </div>
 
-            <div className="p-4 bg-background border-t border-border">
-              <form onSubmit={handleSend} className="max-w-4xl mx-auto relative flex items-end gap-2">
-                <textarea 
+            {/* Input */}
+            <div className="px-6 py-4 border-t border-border bg-background/60 backdrop-blur shrink-0">
+              <form
+                onSubmit={handleSend}
+                className="relative flex items-end gap-2"
+                data-testid="form-send-message"
+              >
+                <textarea
+                  ref={textareaRef}
+                  data-testid="input-message"
                   value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSend(e);
-                    }
-                  }}
-                  placeholder="Transmit command..."
-                  className="w-full bg-input border border-border rounded-lg pl-4 pr-12 py-3 text-sm focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all resize-none min-h-[50px] max-h-[200px]"
+                  onChange={handleTextareaInput}
+                  onKeyDown={handleKeyDown}
+                  disabled={isStreaming}
+                  placeholder={isStreaming ? "Lybrexa is transmitting..." : "Transmit command... (Enter to send, Shift+Enter for newline)"}
+                  className="w-full bg-input border border-border rounded-lg px-4 py-3 pr-12 text-sm focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all resize-none min-h-[50px] max-h-[200px] disabled:opacity-50 disabled:cursor-not-allowed placeholder:text-muted-foreground/50"
                   rows={1}
                 />
-                <button 
+                <button
+                  data-testid="button-send"
                   type="submit"
-                  disabled={!input.trim() || sendMutation.isPending}
-                  className="absolute right-2 bottom-2 p-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 transition-all shadow-[0_0_10px_rgba(157,75,255,0.3)]"
+                  disabled={!input.trim() || isStreaming}
+                  className="absolute right-2 bottom-2 p-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-[0_0_10px_rgba(157,75,255,0.25)]"
                 >
-                  <Send className="w-4 h-4" />
+                  {isStreaming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
                 </button>
               </form>
             </div>
           </>
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground font-mono">
-            <Bot className="w-16 h-16 mb-4 opacity-20" />
-            <p>NO ACTIVE COMM LINK</p>
-            <p className="text-xs mt-2 opacity-50">Select or create a link to begin transmission</p>
+            <Bot className="w-16 h-16 mb-4 opacity-10" />
+            <p className="text-xs uppercase tracking-widest">No active comm link</p>
+            <p className="text-[10px] mt-2 opacity-40">Select or create a link to begin transmission</p>
+            <button
+              data-testid="button-create-first-conversation"
+              onClick={handleCreate}
+              disabled={createMutation.isPending}
+              className="mt-6 flex items-center gap-2 px-4 py-2 bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded text-primary text-xs font-mono uppercase tracking-widest transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Open Comm Link
+            </button>
           </div>
         )}
       </div>

@@ -2,7 +2,7 @@ import { Router } from "express";
 import { db, conversations, messages, memories, agentRuns } from "@workspace/db";
 import { eq, and, asc, desc } from "drizzle-orm";
 import { requireAuth, AuthRequest } from "../lib/auth";
-import { runOrchestrator } from "../agents/orchestrator";
+import { runOrchestrator, streamOrchestrator, routeToAgent } from "../agents/orchestrator";
 
 const router = Router();
 router.use(requireAuth);
@@ -51,7 +51,93 @@ router.delete("/conversations/:id", async (req: AuthRequest, res) => {
   res.status(204).end();
 });
 
-// Send message
+// Stream message (SSE)
+router.post("/conversations/:id/messages/stream", async (req: AuthRequest, res) => {
+  const convId = Number(req.params.id);
+  const { content } = req.body;
+  if (!content) { res.status(400).json({ error: "content required" }); return; }
+
+  const [conv] = await db.select().from(conversations)
+    .where(and(eq(conversations.id, convId), eq(conversations.userId, req.userId!))).limit(1);
+  if (!conv) { res.status(404).json({ error: "Conversation not found" }); return; }
+
+  // Save user message immediately
+  const [userMsg] = await db.insert(messages).values({
+    conversationId: convId, role: "user", content,
+  }).returning();
+
+  // Load history
+  const history = await db.select().from(messages)
+    .where(eq(messages.conversationId, convId))
+    .orderBy(asc(messages.createdAt))
+    .limit(30);
+
+  const historyForOrchestrator = history
+    .filter(m => m.role === "user" || m.role === "assistant")
+    .map(m => ({ role: m.role as "user" | "assistant", content: m.content }));
+
+  // Set SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const agentUsed = routeToAgent(content);
+  const start = Date.now();
+
+  // Send user message and detected agent first
+  res.write(`data: ${JSON.stringify({ type: "init", userMessageId: userMsg.id, agentUsed })}\n\n`);
+
+  const sendEvent = (data: Record<string, unknown>) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  await streamOrchestrator(
+    content,
+    historyForOrchestrator,
+    (token) => {
+      sendEvent({ type: "token", token });
+    },
+    async (fullText, finalAgent) => {
+      const latencyMs = Date.now() - start;
+
+      // Save assistant message
+      const [assistantMsg] = await db.insert(messages).values({
+        conversationId: convId, role: "assistant", content: fullText, agentUsed: finalAgent,
+      }).returning();
+
+      // Update conversation
+      await db.update(conversations).set({
+        agentUsed: finalAgent, updatedAt: new Date(),
+        title: conv.title ?? content.slice(0, 60),
+      }).where(eq(conversations.id, convId));
+
+      // Log agent run
+      await db.insert(agentRuns).values({
+        userId: req.userId!, conversationId: convId, agentName: finalAgent,
+        inputData: { content }, outputData: { text: fullText }, latencyMs,
+      }).catch(() => {});
+
+      // Store memory
+      await db.insert(memories).values({
+        userId: req.userId!, category: "CONVERSATION",
+        title: content.slice(0, 80),
+        content: `${content}\n\n→ ${fullText.slice(0, 400)}`,
+        importance: 0.4, tags: [finalAgent],
+      }).catch(() => {});
+
+      sendEvent({ type: "done", assistantMessageId: assistantMsg.id, agentUsed: finalAgent });
+      res.end();
+    },
+    (err) => {
+      sendEvent({ type: "error", error: err.message });
+      res.end();
+    }
+  );
+});
+
+// Non-streaming send message (kept for compatibility)
 router.post("/conversations/:id/messages", async (req: AuthRequest, res) => {
   const convId = Number(req.params.id);
   const { content } = req.body;
@@ -61,12 +147,10 @@ router.post("/conversations/:id/messages", async (req: AuthRequest, res) => {
     .where(and(eq(conversations.id, convId), eq(conversations.userId, req.userId!))).limit(1);
   if (!conv) { res.status(404).json({ error: "Conversation not found" }); return; }
 
-  // Save user message
   const [userMsg] = await db.insert(messages).values({
     conversationId: convId, role: "user", content,
   }).returning();
 
-  // Load history
   const history = await db.select().from(messages)
     .where(eq(messages.conversationId, convId))
     .orderBy(asc(messages.createdAt))
@@ -82,24 +166,20 @@ router.post("/conversations/:id/messages", async (req: AuthRequest, res) => {
     const { text, agentUsed } = await runOrchestrator(content, historyForOrchestrator);
     const latencyMs = Date.now() - start;
 
-    // Save assistant message
     const [assistantMsg] = await db.insert(messages).values({
       conversationId: convId, role: "assistant", content: text, agentUsed,
     }).returning();
 
-    // Update conversation
     await db.update(conversations).set({
       agentUsed, updatedAt: new Date(),
       title: conv.title ?? content.slice(0, 60),
     }).where(eq(conversations.id, convId));
 
-    // Log agent run
     await db.insert(agentRuns).values({
       userId: req.userId!, conversationId: convId, agentName: agentUsed,
       inputData: { content }, outputData: { text }, latencyMs,
-    });
+    }).catch(() => {});
 
-    // Store conversation summary in memory
     await db.insert(memories).values({
       userId: req.userId!, category: "CONVERSATION",
       title: content.slice(0, 80),
