@@ -5,8 +5,9 @@ import {
   useCreateConversation, useDeleteConversation,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, Send, Bot, User, Loader2, Zap } from "lucide-react";
+import { Plus, Trash2, Send, Bot, User, Loader2, Zap, Mic, MicOff, Volume2 } from "lucide-react";
 import { format } from "date-fns";
+import { useSpeechRecognition } from "@/hooks/use-speech-recognition";
 
 type LocalMessage = {
   id?: number;
@@ -23,7 +24,6 @@ function useStreamingChat(activeId: number | null) {
   const [streamError, setStreamError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Sync localMessages with server messages when conversation changes
   const syncFromServer = useCallback((msgs: LocalMessage[]) => {
     setLocalMessages(msgs);
   }, []);
@@ -36,14 +36,12 @@ function useStreamingChat(activeId: number | null) {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    // Optimistically add user message and an empty assistant placeholder
     const userMsg: LocalMessage = { role: "user", content };
     const assistantPlaceholder: LocalMessage = { role: "assistant", content: "", streaming: true };
     setLocalMessages(prev => [...prev, userMsg, assistantPlaceholder]);
     setIsStreaming(true);
 
     const token = localStorage.getItem("lybrexa_token");
-    let detectedAgent: string | null = null;
 
     try {
       const resp = await fetch(`/api/chat/conversations/${activeId}/messages/stream`, {
@@ -83,9 +81,7 @@ function useStreamingChat(activeId: number | null) {
           let event: Record<string, unknown>;
           try { event = JSON.parse(raw); } catch { continue; }
 
-          if (event.type === "init") {
-            detectedAgent = event.agentUsed as string;
-          } else if (event.type === "token") {
+          if (event.type === "token") {
             const tok = event.token as string;
             setLocalMessages(prev => {
               const next = [...prev];
@@ -96,7 +92,7 @@ function useStreamingChat(activeId: number | null) {
               return next;
             });
           } else if (event.type === "done") {
-            const finalAgent = (event.agentUsed as string) ?? detectedAgent;
+            const finalAgent = event.agentUsed as string;
             setLocalMessages(prev => {
               const next = [...prev];
               const last = next[next.length - 1];
@@ -105,7 +101,6 @@ function useStreamingChat(activeId: number | null) {
               }
               return next;
             });
-            // Refresh server data
             queryClient.invalidateQueries({ queryKey: getGetConversationQueryKey(activeId) });
             queryClient.invalidateQueries({ queryKey: getListConversationsQueryKey() });
           } else if (event.type === "error") {
@@ -117,7 +112,6 @@ function useStreamingChat(activeId: number | null) {
       if (err instanceof Error && err.name === "AbortError") return;
       const msg = err instanceof Error ? err.message : "Unknown error";
       setStreamError(msg);
-      // Remove streaming placeholder on error
       setLocalMessages(prev => prev.filter(m => !m.streaming));
     } finally {
       setIsStreaming(false);
@@ -126,6 +120,42 @@ function useStreamingChat(activeId: number | null) {
   }, [activeId, isStreaming, queryClient]);
 
   return { localMessages, syncFromServer, send, isStreaming, streamError };
+}
+
+function VoicePreviewButton() {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
+
+  const toggle = () => {
+    if (!audioRef.current) {
+      audioRef.current = new Audio("/lybrexa-voice-preview.mp3");
+      audioRef.current.onended = () => setPlaying(false);
+    }
+    if (playing) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+      setPlaying(false);
+    } else {
+      audioRef.current.play().catch(() => {});
+      setPlaying(true);
+    }
+  };
+
+  return (
+    <button
+      data-testid="button-voice-preview"
+      onClick={toggle}
+      title={playing ? "Stop preview" : "Preview Lybrexa voice"}
+      className={`flex items-center gap-1.5 px-2 py-1 rounded border text-[10px] font-mono uppercase tracking-widest transition-all ${
+        playing
+          ? "border-accent/40 bg-accent/10 text-accent"
+          : "border-border text-muted-foreground hover:border-accent/30 hover:text-accent"
+      }`}
+    >
+      <Volume2 className={`w-3 h-3 ${playing ? "animate-pulse" : ""}`} />
+      {playing ? "Playing..." : "Voice Preview"}
+    </button>
+  );
 }
 
 export default function Chat() {
@@ -145,7 +175,33 @@ export default function Chat() {
 
   const { localMessages, syncFromServer, send, isStreaming, streamError } = useStreamingChat(activeId);
 
-  // Sync server messages into local state when conversation loads / changes
+  const {
+    state: voiceState,
+    interimText,
+    errorMessage: voiceError,
+    isListening,
+    isUnsupported,
+    start: startListening,
+    stop: stopListening,
+    abort: abortListening,
+  } = useSpeechRecognition({
+    onTranscript: (text) => {
+      setInput(prev => {
+        const joined = prev.trim() ? `${prev.trim()} ${text}` : text;
+        // Resize textarea after state update
+        setTimeout(() => {
+          if (textareaRef.current) {
+            textareaRef.current.style.height = "auto";
+            textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 200) + "px";
+          }
+        }, 0);
+        return joined;
+      });
+      // Focus the textarea after transcription
+      setTimeout(() => textareaRef.current?.focus(), 50);
+    },
+  });
+
   useEffect(() => {
     if (activeConv?.messages && !isStreaming) {
       syncFromServer(activeConv.messages.map(m => ({
@@ -167,6 +223,11 @@ export default function Chat() {
     }
   }, [conversations, activeId]);
 
+  // Stop listening if streaming starts
+  useEffect(() => {
+    if (isStreaming && isListening) abortListening();
+  }, [isStreaming, isListening, abortListening]);
+
   const handleCreate = () => {
     createMutation.mutate({ data: { title: undefined } }, {
       onSuccess: (newConv) => {
@@ -179,10 +240,10 @@ export default function Chat() {
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isListening) stopListening();
     const content = input.trim();
     if (!content || !activeId || isStreaming) return;
     setInput("");
-    // Reset textarea height
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     await send(content);
   };
@@ -192,10 +253,7 @@ export default function Chat() {
     deleteMutation.mutate({ id }, {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: getListConversationsQueryKey() });
-        if (activeId === id) {
-          setActiveId(null);
-          syncFromServer([]);
-        }
+        if (activeId === id) { setActiveId(null); syncFromServer([]); }
       },
     });
   };
@@ -209,11 +267,22 @@ export default function Chat() {
 
   const handleTextareaInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value);
-    // Auto-resize
     const el = e.target;
     el.style.height = "auto";
     el.style.height = Math.min(el.scrollHeight, 200) + "px";
   };
+
+  const handleMicClick = () => {
+    if (isListening) {
+      stopListening();
+    } else {
+      startListening();
+    }
+  };
+
+  // Mic button appearance
+  const micDisabled = isUnsupported || isStreaming;
+  const showInterim = isListening && interimText;
 
   return (
     <div className="flex h-full w-full" data-testid="chat-page">
@@ -286,12 +355,21 @@ export default function Chat() {
                 </h3>
                 <p className="text-[10px] text-muted-foreground font-mono tracking-widest mt-0.5">SECURE CHANNEL ESTABLISHED</p>
               </div>
-              {isStreaming && (
-                <div className="flex items-center gap-1.5 text-accent text-[10px] font-mono tracking-widest shrink-0">
-                  <Zap className="w-3 h-3 animate-pulse" />
-                  STREAMING
-                </div>
-              )}
+              <div className="flex items-center gap-2 shrink-0">
+                <VoicePreviewButton />
+                {isStreaming && (
+                  <div className="flex items-center gap-1.5 text-accent text-[10px] font-mono tracking-widest">
+                    <Zap className="w-3 h-3 animate-pulse" />
+                    STREAMING
+                  </div>
+                )}
+                {isListening && (
+                  <div className="flex items-center gap-1.5 text-destructive text-[10px] font-mono tracking-widest">
+                    <span className="w-1.5 h-1.5 rounded-full bg-destructive animate-ping" />
+                    LISTENING
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Messages */}
@@ -312,7 +390,6 @@ export default function Chat() {
                     data-testid={`message-${m.role}-${i}`}
                     className={`flex gap-3 ${m.role === "user" ? "flex-row-reverse" : ""}`}
                   >
-                    {/* Avatar */}
                     <div className={`w-7 h-7 rounded shrink-0 flex items-center justify-center border ${
                       m.role === "user"
                         ? "bg-primary/15 border-primary/40 text-primary"
@@ -321,7 +398,6 @@ export default function Chat() {
                       {m.role === "user" ? <User className="w-3.5 h-3.5" /> : <Bot className="w-3.5 h-3.5" />}
                     </div>
 
-                    {/* Bubble */}
                     <div className={`flex flex-col gap-1 max-w-[75%] ${m.role === "user" ? "items-end" : "items-start"}`}>
                       <div className="flex items-center gap-2 px-0.5">
                         <span className="text-[9px] uppercase tracking-widest font-mono text-muted-foreground">
@@ -354,9 +430,8 @@ export default function Chat() {
                 ))
               )}
 
-              {/* Error banner */}
               {streamError && (
-                <div className="max-w-2xl mx-auto p-3 bg-destructive/10 border border-destructive/30 rounded text-xs text-destructive font-mono">
+                <div className="p-3 bg-destructive/10 border border-destructive/30 rounded text-xs text-destructive font-mono">
                   TRANSMISSION ERROR: {streamError}
                 </div>
               )}
@@ -364,8 +439,24 @@ export default function Chat() {
               <div ref={messagesEndRef} />
             </div>
 
-            {/* Input */}
+            {/* Input area */}
             <div className="px-6 py-4 border-t border-border bg-background/60 backdrop-blur shrink-0">
+
+              {/* Interim voice text preview */}
+              {showInterim && (
+                <div className="mb-2 px-4 py-2 rounded border border-destructive/20 bg-destructive/5 text-xs text-muted-foreground font-mono flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-destructive shrink-0 animate-ping" />
+                  <span className="italic opacity-70">{interimText}</span>
+                </div>
+              )}
+
+              {/* Voice error */}
+              {voiceError && !isListening && (
+                <div className="mb-2 px-3 py-1.5 rounded border border-destructive/20 bg-destructive/5 text-[10px] text-destructive font-mono">
+                  {voiceError}
+                </div>
+              )}
+
               <form
                 onSubmit={handleSend}
                 className="relative flex items-end gap-2"
@@ -378,10 +469,40 @@ export default function Chat() {
                   onChange={handleTextareaInput}
                   onKeyDown={handleKeyDown}
                   disabled={isStreaming}
-                  placeholder={isStreaming ? "Lybrexa is transmitting..." : "Transmit command... (Enter to send, Shift+Enter for newline)"}
-                  className="w-full bg-input border border-border rounded-lg px-4 py-3 pr-12 text-sm focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary transition-all resize-none min-h-[50px] max-h-[200px] disabled:opacity-50 disabled:cursor-not-allowed placeholder:text-muted-foreground/50"
+                  placeholder={
+                    isStreaming
+                      ? "Lybrexa is transmitting..."
+                      : isListening
+                      ? "Listening... speak your command"
+                      : "Transmit command... (Enter to send, Shift+Enter for newline)"
+                  }
+                  className={`w-full bg-input border rounded-lg px-4 py-3 pr-24 text-sm focus:outline-none focus:ring-1 transition-all resize-none min-h-[50px] max-h-[200px] disabled:opacity-50 disabled:cursor-not-allowed placeholder:text-muted-foreground/50 ${
+                    isListening
+                      ? "border-destructive/50 focus:border-destructive focus:ring-destructive/30 shadow-[0_0_12px_rgba(255,50,80,0.08)]"
+                      : "border-border focus:border-primary focus:ring-primary"
+                  }`}
                   rows={1}
                 />
+
+                {/* Mic button */}
+                {!isUnsupported && (
+                  <button
+                    data-testid="button-mic"
+                    type="button"
+                    onClick={handleMicClick}
+                    disabled={micDisabled}
+                    title={isListening ? "Stop recording (click or send)" : "Start voice input"}
+                    className={`absolute right-10 bottom-2 p-2 rounded transition-all disabled:opacity-30 disabled:cursor-not-allowed ${
+                      isListening
+                        ? "bg-destructive/20 text-destructive border border-destructive/40 shadow-[0_0_12px_rgba(255,50,80,0.2)] animate-pulse"
+                        : "text-muted-foreground hover:bg-primary/10 hover:text-primary"
+                    }`}
+                  >
+                    {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                  </button>
+                )}
+
+                {/* Send button */}
                 <button
                   data-testid="button-send"
                   type="submit"
@@ -391,6 +512,13 @@ export default function Chat() {
                   {isStreaming ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
                 </button>
               </form>
+
+              {/* Voice hint */}
+              {!isUnsupported && !isStreaming && (
+                <p className="text-[9px] text-muted-foreground/40 font-mono mt-1.5 text-right">
+                  {isListening ? "click mic or send to confirm" : "mic for voice input"}
+                </p>
+              )}
             </div>
           </>
         ) : (
