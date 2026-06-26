@@ -3,18 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
   "exports": {
-    ".": "start": "node index.js",
-    "./batch": "./src/batch/index.ts",
-    "./image": "./src/image/index.ts",
-    "./audio": "./src/audio/index.ts"
+    ".": "./index.js",
+    ...
   },
-  "dependencies": {
-    "openai": "^6.27.0",
-    "p-limit": "^7.3.0",
-    "p-retry": "^7.1.1"
-  },
-  "devDependencies": {
-    "@types/node": "catalog:"
-  }
+  ...
 }
