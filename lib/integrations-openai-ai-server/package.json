@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts",
+    ".": "start": "node index.js",
     "./batch": "./src/batch/index.ts",
     "./image": "./src/image/index.ts",
     "./audio": "./src/audio/index.ts"
