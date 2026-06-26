@@ -6,9 +6,11 @@ RUN apt-get update && apt-get install -y curl gnupg \
   && apt-get update && apt-get install -y tailscale \
   && rm -rf /var/lib/apt/lists/*
 
+RUN npm install -g pnpm
+
 WORKDIR /app
-COPY package*.json ./
-RUN npm install
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml* ./
+RUN pnpm install --frozen-lockfile
 COPY . .
 
 COPY start.sh /app/start.sh
