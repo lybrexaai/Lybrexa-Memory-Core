@@ -8,6 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Plus, Trash2, Send, Bot, User, Loader2, Zap, Mic, MicOff, Volume2 } from "lucide-react";
 import { format } from "date-fns";
 import { useSpeechRecognition } from "@/hooks/use-speech-recognition";
+import { MarkdownMessage } from "@/components/markdown-message";
 
 type LocalMessage = {
   id?: number;
@@ -415,14 +416,17 @@ export default function Chat() {
                         )}
                       </div>
 
-                      <div className={`px-4 py-3 rounded-lg text-sm leading-relaxed whitespace-pre-wrap ${
+                      <div className={`px-4 py-3 rounded-lg ${
                         m.role === "user"
-                          ? "bg-primary/10 border border-primary/25 text-foreground"
+                          ? "bg-primary/10 border border-primary/25 text-foreground text-sm leading-relaxed whitespace-pre-wrap"
                           : "bg-card border border-border text-foreground"
                       }`}>
-                        {m.content}
-                        {m.streaming && (
-                          <span className="inline-block w-0.5 h-4 bg-primary ml-0.5 align-middle animate-pulse" />
+                        {m.role === "user" ? (
+                          <>
+                            {m.content}
+                          </>
+                        ) : (
+                          <MarkdownMessage content={m.content} streaming={m.streaming} />
                         )}
                       </div>
                     </div>
